@@ -1,0 +1,16 @@
+# =============================================================================
+# .gitignore — sec-dev (local single-project scanner)
+# =============================================================================
+
+# Scan results: never commit (JSON + HTML + logs)
+data/
+
+# Local semgrep venv created by bin/install_tools.sh
+.venv/
+
+# Python bytecode
+__pycache__/
+
+# Tool scratch
+.trivycache/
+.semgrep_cache/

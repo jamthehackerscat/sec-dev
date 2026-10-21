@@ -1,0 +1,364 @@
+#!/usr/bin/env python3
+"""
+render_reports.py — turn raw scanner JSON into dev-friendly HTML (sec-dev).
+
+Reads  data/reports/<name>/json/{sast,secrets,sca}.json  (paths resolved
+relative to this tool's root) and writes HTML pages into
+data/reports/<name>/html:
+    sast.html, secrets.html, sca.html, digest.html
+
+Only the pages for the tools given with --tools are rendered, so a single-tool
+run (e.g. only gitleaks) still produces a complete report and digest without
+the other JSON files existing. Missing or unreadable JSON files render as an
+empty page instead of crashing.
+
+The HTML is aimed at regular developers (not a security team): each page shows
+a plain-language summary count, then a table of findings with severity, exact
+file:line, a short explanation, and a "how to fix" hint.
+
+Overrides:
+    --input  dir holding the JSON files (default: sec-dev/data/reports/<name>/json)
+    --output dir to write HTML into    (default: input dir)
+
+Usage:
+    python3 render_reports.py <name> [--tools semgrep gitleaks trivy] [--dry-run]
+"""
+import argparse
+import html
+import json
+import sys
+from collections import Counter
+from pathlib import Path
+
+PAGE_CSS = """
+body{font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:0;color:#222}
+.wrap{max-width:1000px;margin:0 auto;padding:24px}
+h1{font-size:22px}
+h2{font-size:18px;margin-top:28px}
+.badge{display:inline-block;padding:2px 10px;border-radius:12px;color:#fff;font-weight:600;font-size:12px;margin-left:6px}
+table{border-collapse:collapse;width:100%;margin-top:12px;font-size:14px}
+th,td{border:1px solid #e1e4e8;padding:8px 10px;text-align:left;vertical-align:top}
+th{background:#f6f8fa}
+.file{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
+.sev{font-weight:600;text-transform:uppercase;font-size:12px}
+.sev-CRITICAL,.sev-HIGH{color:#b60205}
+.sev-MEDIUM,.sev-WARNING{color:#d93f0b}
+.sev-LOW{color:#735c0f}
+.hint{color:#24292f;background:#fff8c5;border-left:3px solid #f1c40f;padding:6px 10px;font-size:13px;border-radius:0 4px 4px 0}
+.small{color:#586069;font-size:13px}
+a{color:#0969da;text-decoration:none}
+.nav a{margin-right:14px}
+"""
+
+
+def esc(s):
+    return html.escape(str(s), quote=True)
+
+
+def sev_class(sev):
+    sev = (sev or "").upper()
+    if sev in ("CRITICAL", "HIGH"):
+        return "CRITICAL"
+    if sev in ("MEDIUM", "WARNING"):
+        return "MEDIUM"
+    return "LOW"
+
+
+# Canonical order: Critical > High > Medium > Low (then anything unknown).
+SEV_ORDER = ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
+
+# Semgrep still emits legacy severity labels for many rules. The mapping is:
+#   ERROR  -> HIGH
+#   WARNING-> MEDIUM
+#   INFO   -> LOW
+# (See Semgrep docs: all rules have one of Critical/High/Medium/Low).
+LEGACY_SEV = {"ERROR": "HIGH", "WARNING": "MEDIUM", "INFO": "LOW"}
+
+
+def normalize_sev(sev):
+    """Canonicalize a scanner severity; unknown values fall back to LOW."""
+    s = (sev or "").upper()
+    return LEGACY_SEV.get(s, s if s in SEV_ORDER else "LOW")
+
+
+def summary_pills(summary):
+    colors = {
+        "CRITICAL": "#b60205", "HIGH": "#d73a49", "MEDIUM": "#dbab09",
+        "WARNING": "#dbab09", "LOW": "#735c0f", "INFO": "#6f42c1",
+        "ERROR": "#b60205", "UNKNOWN": "#586069",
+    }
+    # Show highest severity first: CRITICAL > HIGH > MEDIUM > LOW, then any
+    # unknown severity keys last (in insertion order).
+    def key(item):
+        sev = item[0]
+        if sev in SEV_ORDER:
+            return (0, SEV_ORDER.index(sev))
+        return (1, 0)
+
+    items = [(k, v, colors.get(k, "#586069")) for k, v in summary.items() if v]
+    items.sort(key=lambda kv: key((kv[0], kv[1])))
+    return items
+
+
+def row_fields_header():
+    return "<th>Severity</th><th>Location</th><th>Finding</th><th>How to fix</th>"
+
+
+# Header for pages without a severity column (e.g. secrets).
+def row_fields_header_nosev():
+    return "<th>Location</th><th>Finding</th><th>How to fix</th>"
+
+
+def page(title, subtitle, summary, rows, nav, header=None):
+    # Total = number of rendered rows (each row starts with <tr>). This keeps
+    # the count correct even when a scanner has no severity bucket (secrets).
+    total = rows.count("<tr>")
+    badges = "".join(
+        f"<span class='badge' style='background:{color}'>{k}:{v}</span>"
+        for k, v, color in summary_pills(summary)
+    ) if summary else ""
+    nav_html = "<div class='nav'>" + "".join(
+        f'<a href="{href}">{label}</a>' for label, href in nav
+    ) + "</div>"
+    return f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>{esc(title)}</title>
+<style>{PAGE_CSS}</style></head><body><div class="wrap">
+{nav_html}
+<h1>{esc(title)}</h1>
+<p class="small">{esc(subtitle)}</p>
+<p>Total findings: <strong>{total}</strong> {badges}</p>
+<table><thead><tr>{header or row_fields_header()}</tr></thead><tbody>
+{rows}
+</tbody></table>
+<p class="small">Generated by sec-dev/bin/render_reports.py</p>
+</div></body></html>"""
+
+
+# --- Helpers -----------------------------------------------------------------
+def repo_relative(path, repo):
+    """Strip any leading repo/scan prefix so files show repo-relative."""
+    p = str(path).replace("\\", "/")
+    # Split on the repo name; keep everything after the last occurrence.
+    idx = p.rfind(f"/{repo}/")
+    return p[idx + len(repo) + 2:] if idx != -1 else p
+
+
+def load_json_any_enc(path):
+    """Read a JSON file, tolerating odd encodings; None if missing/unreadable."""
+    try:
+        raw = Path(path).read_bytes()
+    except OSError:
+        return None
+    for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
+        try:
+            return json.loads(raw.decode(enc))
+        except (UnicodeDecodeError, ValueError):
+            continue
+    return None
+
+
+def load_json(path):
+    """Read a JSON file; None if missing, empty or not valid JSON."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+# --- SAST (semgrep) ----------------------------------------------------------
+def parse_sast(path, repo):
+    data = load_json_any_enc(path)
+    if data is None:
+        return Counter(), ""
+    summary = Counter()
+    rows = []
+    for r in data.get("results", []):
+        extra = r.get("extra", {})
+        sev = normalize_sev(extra.get("severity"))
+        summary[sev] += 1
+        loc = f'{repo_relative(r.get("path", ""), repo)}:{r.get("start", {}).get("line", "")}'
+        msg = (extra.get("message") or "").splitlines()[0] if extra.get("message") else ""
+        meta = extra.get("metadata", {})
+        hint = ""
+        if extra.get("fix"):
+            hint = f'<pre class="fix">{esc(extra["fix"])}</pre>'
+        for key in ("references", "fix"):
+            if not hint and meta.get(key):
+                v = meta[key]
+                hint = "See " + (v[0] if isinstance(v, list) else str(v))
+                break
+        if not hint:
+            hint = "Review the code flagged here; apply the vendor/library guidance."
+        row = (
+            "<tr>"
+            f'<td class="sev sev-{sev_class(sev)}">{esc(sev)}</td>'
+            f'<td class="file">{esc(loc)}</td>'
+            f"<td>{esc(msg)}</td>"
+            f'<td><div class="hint">{hint}</div></td>'
+            "</tr>"
+        )
+        rows.append((sev, row))
+    rows.sort(key=lambda sr: SEV_ORDER.index(sr[0]))
+    return summary, "\n".join(r for _, r in rows)
+
+
+# --- Secrets (gitleaks) ------------------------------------------------------
+def parse_secrets(path, repo):
+    data = load_json(path)
+    if data is None:
+        return Counter(), ""
+    findings = data if isinstance(data, list) else data.get("Findings", [])
+    summary = Counter()
+    rows = []
+    for r in findings:
+        loc = f'{repo_relative(r.get("File", ""), repo)}:{r.get("StartLine", "")}'
+        desc = r.get("Description") or r.get("RuleID", "")
+        row = (
+            "<tr>"
+            f'<td class="file">{esc(loc)}</td>'
+            f"<td>{esc(desc)}</td>"
+            '<td><div class="hint">Rotate the secret immediately, then remove it from the repo and history.</div></td>'
+            "</tr>"
+        )
+        rows.append(row)
+    return summary, "\n".join(rows)
+
+
+# --- SCA (trivy) -------------------------------------------------------------
+def parse_sca(path, repo):
+    data = load_json(path)
+    if data is None:
+        return Counter(), ""
+    summary = Counter()
+    rows = []
+    for result in data.get("Results", []):
+        target = repo_relative(result.get("Target", ""), repo)
+        for v in result.get("Vulnerabilities", []):
+            sev = normalize_sev(v.get("Severity"))
+            summary[sev] += 1
+            pkg = v.get("PkgName", "")
+            installed = v.get("InstalledVersion", "")
+            fixed = v.get("FixedVersion")
+            loc = f"{target} · {pkg}"
+            if fixed:
+                hint = f"Upgrade to {fixed} (currently {installed})"
+            else:
+                hint = f"No fixed version listed yet (currently {installed})"
+            title = v.get("Title") or v.get("VulnerabilityID", "")
+            row = (
+                "<tr>"
+                f'<td class="sev sev-{sev_class(sev)}">{esc(sev)}</td>'
+                f'<td class="file">{esc(loc)}</td>'
+                f"<td>{esc(title)}</td>"
+                f'<td><div class="hint">{esc(hint)}</div></td>'
+                "</tr>"
+            )
+            rows.append((sev, row))
+    rows.sort(key=lambda sr: SEV_ORDER.index(sr[0]))
+    return summary, "\n".join(r for _, r in rows)
+
+
+# --- Pages -------------------------------------------------------------------
+# tool name -> (html file, page title, scanner label, parse fn, header fn)
+TOOL_PAGES = {
+    "semgrep": ("sast.html", "SAST — Static Analysis", "Semgrep",
+                parse_sast, row_fields_header),
+    "gitleaks": ("secrets.html", "Secrets — Credential Exposure", "Gitleaks",
+                 parse_secrets, row_fields_header_nosev),
+    "trivy": ("sca.html", "SCA — Dependency Vulnerabilities", "Trivy",
+              parse_sca, row_fields_header),
+}
+PAGE_ORDER = ["semgrep", "gitleaks", "trivy"]
+
+
+def render_repo(repo, input_dir, output_dir, tools):
+    """tools: list of 'semgrep' | 'gitleaks' | 'trivy' to render (may be a subset)."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    files = {}
+    summaries = {}
+
+    for tool in PAGE_ORDER:
+        if tool not in tools:
+            continue
+        fname, title, label, parse_fn, header_fn = TOOL_PAGES[tool]
+        summary, rows = parse_fn(input_dir / fname.replace(".html", ".json"), repo)
+        summaries[tool] = (summary, rows)
+        files[fname] = page(title, f"{repo} · {label}", summary, rows,
+                            _nav(tools), header=header_fn())
+
+    digest_badges = "".join(
+        f"<p><strong>{label}:</strong> {rows.count('<tr>')} finding(s) "
+        f"<a href='{fname}'>view</a></p>"
+        for tool in PAGE_ORDER if tool in tools
+        for fname, label in [(TOOL_PAGES[tool][0], TOOL_PAGES[tool][1].split(" — ")[0])]
+        for _, rows in [summaries[tool]]
+    )
+    files["digest.html"] = (
+        "<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'>"
+        f"<title>Digest — {esc(repo)}</title><style>{PAGE_CSS}</style></head>"
+        f"<body><div class='wrap'>{_nav_html(tools)}"
+        f"<h1>Security Digest — {esc(repo)}</h1>"
+        "<p class='small'>Summary of the scans for this project.</p>"
+        f"{digest_badges}</div></body></html>"
+    )
+
+    for name, content in files.items():
+        (output_dir / name).write_text(content, encoding="utf-8")
+    return files
+
+
+def _nav(tools):
+    return [(TOOL_PAGES[t][1].split(" — ")[0], TOOL_PAGES[t][0])
+            for t in PAGE_ORDER if t in tools] + [("Digest", "digest.html")]
+
+
+def _nav_html(tools):
+    return "<div class='nav'>" + "".join(
+        f'<a href="{href}">{label}</a>' for label, href in _nav(tools)
+    ) + "</div>"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Render per-project JSON into HTML reports.")
+    parser.add_argument("repo")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--input", type=Path)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--tools",
+                        help="tools to render: semgrep, gitleaks, trivy (default: all three)")
+    args = parser.parse_args()
+
+    if args.tools:
+        tools = [t.strip() for t in args.tools.replace(",", " ").split() if t.strip()]
+        for t in tools:
+            if t not in TOOL_PAGES:
+                print(f"error: unknown tool '{t}' (choose from: {', '.join(TOOL_PAGES)})",
+                      file=sys.stderr)
+                return 2
+        tools = [t for t in PAGE_ORDER if t in tools]   # dedupe, canonical order
+    else:
+        tools = list(PAGE_ORDER)
+
+    dev_dir = Path(__file__).resolve().parent.parent
+    input_dir = args.input or (dev_dir / "data" / "reports" / args.repo / "json")
+    output_dir = args.output or (dev_dir / "data" / "reports" / args.repo / "html")
+
+    if args.dry_run:
+        for tool in tools:
+            print(f"  DRY-RUN: would write {output_dir / TOOL_PAGES[tool][0]}")
+        print(f"  DRY-RUN: would write {output_dir / 'digest.html'}")
+        return 0
+
+    render_repo(args.repo, input_dir, output_dir, tools)
+    print(f"Wrote HTML reports for {args.repo} to {output_dir}")
+    for tool in tools:
+        p = output_dir / TOOL_PAGES[tool][0]
+        print(f"  {'OK ' if p.exists() else 'MISS'} {p}")
+    p = output_dir / "digest.html"
+    print(f"  {'OK ' if p.exists() else 'MISS'} {p}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
